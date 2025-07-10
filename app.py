@@ -79,13 +79,14 @@ if (uploaded_file or input_url) and (not docs_list or all(len(doc.page_content.s
     st.stop()
 
 if docs_list:
-    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=500, chunk_overlap=50)
-    doc_splits = text_splitter.split_documents(docs_list)
-
-    db = Chroma.from_documents(doc_splits, embeddings, persist_directory=chroma_dir)
-    retriever = db.as_retriever()
-
-    st.sidebar.success("You can now ask questions based on this document.")
+    with st.spinner("Splitting and indexing document, please wait..."):
+        text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=500, chunk_overlap=50)
+        doc_splits = text_splitter.split_documents(docs_list)
+        
+        db = Chroma.from_documents(doc_splits, embeddings, persist_directory=chroma_dir)
+        retriever = db.as_retriever()
+        
+        st.sidebar.success("You can now ask questions based on this document.")
 
 # Setup LLM
 llm = ChatGroq(groq_api_key=groq_api_key, model_name="Gemma2-9b-It")
