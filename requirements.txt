@@ -11,5 +11,6 @@ google-search-results
 arxiv
 wikipedia
 bs4
+tiktoken
 protobuf==3.20.3
 pysqlite3-binary
