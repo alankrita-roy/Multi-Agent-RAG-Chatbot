@@ -141,6 +141,7 @@ app = workflow.compile()
 
 # Run on question directly
 if question:
+    st.markdown(f"### Your Question: {question}")
     inputs = {"question": question}
     all_responses = []
 
@@ -158,7 +159,7 @@ if question:
 
     {combined_text}
 
-    Please provide the most accurate and relevant response to the original question: "{question}"
+    Please provide the most accurate and relevant response to the original question: {question}
     """
 
     final_answer = llm.invoke(final_prompt)
