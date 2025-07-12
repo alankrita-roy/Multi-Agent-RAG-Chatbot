@@ -93,7 +93,7 @@ llm = ChatGroq(groq_api_key=groq_api_key, model_name="Gemma2-9b-It")
 
 # Tool Wrappers
 arxiv = ArxivQueryRun(api_wrapper=ArxivAPIWrapper(top_k_results=1))
-serp = SerpAPIWrapper(serpapi_api_key=serp_api_key, engine="google")
+serp = SerpAPIWrapper(serpapi_api_key=serp_api_key)
 wikipedia = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper(top_k_results=1))
 
 # State
