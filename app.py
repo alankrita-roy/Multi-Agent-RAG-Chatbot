@@ -1,11 +1,10 @@
 import os
 import tempfile
 import shutil
-#from dotenv import load_dotenv
 import streamlit as st
+import sys
 
 # ---- PATCH for ChromaDB: Fix sqlite3 version ----
-import sys
 os.environ["PYSQLITE3_INCLUDE_PATH"] = "/home/adminuser/venv/lib/python3.10/site-packages/pysqlite3"
 import pysqlite3
 sys.modules["sqlite3"] = pysqlite3
@@ -17,7 +16,6 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_community.utilities import ArxivAPIWrapper, WikipediaAPIWrapper, SerpAPIWrapper
 from langchain_community.tools import ArxivQueryRun, WikipediaQueryRun
-
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain.schema import Document
@@ -26,11 +24,6 @@ from langgraph.graph import END, StateGraph, START
 from typing_extensions import TypedDict
 
 # Load environment variables
-#load_dotenv()
-
-# Ensure required environment variables are present
-#groq_api_key = os.getenv("GROQ_API_KEY")
-#serp_api_key = os.getenv("SERP_API_KEY")
 groq_api_key = st.secrets["GROQ_API_KEY"]
 serp_api_key = st.secrets["SERP_API_KEY"]
 
@@ -102,7 +95,6 @@ class GraphState(TypedDict):
     documents: List[str]
 
 # Retrieval Functions
-
 def retrieve(state):
     question = state["question"]
     documents = retriever.invoke(question)
@@ -135,7 +127,6 @@ workflow.add_edge("retrieve", "wiki_search")
 workflow.add_edge("wiki_search", "arxiv_search")
 workflow.add_edge("arxiv_search", "serp_search")
 workflow.add_edge("serp_search", END)
-
 workflow.add_edge(START, "retrieve" if retriever else "wiki_search")
 
 app = workflow.compile()
@@ -147,31 +138,58 @@ if question:
     all_responses = []
 
     with st.spinner("Searching, please wait..."):
-        for output in app.stream(inputs):
-            for key, value in output.items():
-                docs = value.get("documents", [])
-                for doc in docs:
-                    all_responses.append((key, doc.page_content))
+        question_word_count = len(question.split())
+        is_specific_question = question_word_count > 5
+        use_document = retriever is not None and is_specific_question
 
-    combined_text = "\n\n".join([f"Source: {key}\n{content}" for key, content in all_responses])
+        if use_document:
+            st.info("🔎 Using uploaded document for answering...")
+            docs = retriever.invoke(question)
+            cleaned_docs = [doc.page_content for doc in docs]
+            combined_text = "\n\n".join([f"{content}" for content in cleaned_docs])
+        else:
+            st.info("🌐 Using multi-agent (Wiki, Arxiv, Google) sources...")
+            for output in app.stream(inputs):
+                for key, value in output.items():
+                    docs = value.get("documents", [])
+                    for doc in docs:
+                        all_responses.append((key, doc.page_content))
+
+            combined_text = "\n\n".join([f"Source: {key}\n{content}" for key, content in all_responses])
+
+    # Truncate long content
+    max_chars = 7000
+    if len(combined_text) > max_chars:
+        combined_text = combined_text[:max_chars] + "\n[...truncated...]"
 
     final_prompt = f"""
-    You are a helpful assistant. Here are the answers from different sources:
+    You are a helpful assistant. Below are excerpts from relevant sources:
 
     {combined_text}
 
-    Please provide the most accurate and relevant response to the original question: {question}
+    Based on this, please provide the most accurate and relevant answer to: {question}
     """
 
-    final_answer = llm.invoke(final_prompt)
+    try:
+        final_answer = llm.invoke(final_prompt)
+    except Exception as e:
+        st.error("❌ LLM failed to generate a response. Try again or reduce input size.")
+        st.exception(e)
+        final_answer = None
 
     with st.expander("See Agent Work"):
-        for key, content in all_responses:
-            st.markdown(f"### Source: `{key}`")
-            st.write(content)
+        if use_document:
+            for i, doc in enumerate(cleaned_docs):
+                st.markdown(f"### Source: `retriever - chunk {i+1}`")
+                st.write(doc)
+        else:
+            for key, content in all_responses:
+                st.markdown(f"### Source: `{key}`")
+                st.write(content)
 
-    st.markdown("## Your Answer")
-    st.write(final_answer.content)
+    if final_answer:
+        st.markdown("## Your Answer")
+        st.write(final_answer.content)
 
 # Cleanup on close
 @st.cache_resource
