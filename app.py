@@ -1,36 +1,14 @@
 import os
-import sys
-import gc
-import atexit
-import shutil
 import tempfile
-from typing import List, Tuple
-
+import shutil
 import streamlit as st
+import sys
 
-# ===============================
-# Streamlit Multi‑Agent RAG (Low‑Memory)
-# – Keeps original functionality:
-#   * Upload PDF or fetch URL ➜ Chroma retriever
-#   * Multi‑agent external search: Wikipedia ➜ Arxiv ➜ Google (SerpAPI)
-#   * Gemma2‑9B‑It (Groq) for final synthesis
-# – Memory‑safe tactics:
-#   * Smaller chunks, capped index size
-#   * Top‑K retrieval only
-#   * Aggressive context truncation
-#   * No large global buffers; stream to UI
-#   * Temp Chroma dir cleaned with atexit
-# ===============================
-
-# ---- PATCH for ChromaDB: Fix sqlite3 version (kept from your original) ----
+# ---- PATCH for ChromaDB: Fix sqlite3 version ----
 os.environ["PYSQLITE3_INCLUDE_PATH"] = "/home/adminuser/venv/lib/python3.10/site-packages/pysqlite3"
-try:
-    import pysqlite3  # type: ignore
-    sys.modules["sqlite3"] = pysqlite3
-except Exception:
-    pass  # In case local environment already provides correct sqlite3
+import pysqlite3
+sys.modules["sqlite3"] = pysqlite3
 
-# ---- LangChain / LangGraph imports (match your original stack) ----
 from langchain_community.document_loaders import WebBaseLoader, PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -38,248 +16,184 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_community.utilities import ArxivAPIWrapper, WikipediaAPIWrapper, SerpAPIWrapper
 from langchain_community.tools import ArxivQueryRun, WikipediaQueryRun
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain.schema import Document
+from typing import List
 from langgraph.graph import END, StateGraph, START
 from typing_extensions import TypedDict
 
-# ===============================
-# Config knobs (tuned for Streamlit Community Cloud limits)
-# ===============================
-CHUNK_SIZE = 300
-CHUNK_OVERLAP = 20
-MAX_INDEX_CHUNKS = 60        # Cap indexed chunks to avoid memory bloat
-RETRIEVER_K = 3              # Top‑K for doc retriever
-MAX_CTX_CHARS = 3600         # Total characters to send to LLM
-PER_SOURCE_TAKE = 1          # Take at most 1 doc/summary per external source in the graph stream
+# Load environment variables
+groq_api_key = st.secrets["GROQ_API_KEY"]
+serp_api_key = st.secrets["SERP_API_KEY"]
 
-# ===============================
+if not groq_api_key or not serp_api_key:
+    st.error("Missing required API keys. Please check your environment variables.")
+    st.stop()
+
+# Temporary Chroma DB Directory
+chroma_dir = tempfile.mkdtemp()
+
 # Streamlit UI
-# ===============================
 st.set_page_config(page_title="RAG Chatbot", layout="wide")
 st.sidebar.title("Options")
 
 uploaded_file = st.sidebar.file_uploader("Upload a PDF", type=["pdf"])
 input_url = st.sidebar.text_input("Paste a URL")
 
-st.title("Multi‑Agent Chatbot with Wiki, Arxiv & Google Search")
+st.title("Multi Agent Chatbot with Wiki, Arxiv and Google Search")
 question = st.chat_input("Ask your question")
 
-# ===============================
-# Secrets / API Keys
-# ===============================
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
-SERP_API_KEY = st.secrets.get("SERP_API_KEY")
-
-if not GROQ_API_KEY:
-    st.error("Missing GROQ_API_KEY in Streamlit secrets.")
-    st.stop()
-
-# ===============================
-# Temp Chroma directory + cleanup
-# ===============================
-chroma_dir = tempfile.mkdtemp(prefix="chroma_")
-atexit.register(lambda: shutil.rmtree(chroma_dir, ignore_errors=True))
-
-# ===============================
-# Embeddings (kept same model, CPU)
-# ===============================
+# Initialize Embeddings
 embeddings = HuggingFaceEmbeddings(
     model_name="all-MiniLM-L6-v2",
     model_kwargs={"device": "cpu"}
 )
 
-# ===============================
-# Load document(s) if provided
-# ===============================
-docs_list: List[Document] = []
+# Load documents
+docs_list = []
 retriever = None
 
 if uploaded_file:
-    with st.spinner("Indexing PDF…"):
-        # Store to a temp file to let PyPDFLoader read it
+    with st.spinner("Indexing PDF, please wait..."):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
             tmp_file.write(uploaded_file.getbuffer())
             tmp_file_path = tmp_file.name
-        try:
-            loader = PyPDFLoader(tmp_file_path)
-            docs_list = loader.load()
-        finally:
-            try:
-                os.remove(tmp_file_path)
-            except Exception:
-                pass
+        loader = PyPDFLoader(tmp_file_path)
+        docs_list = loader.load()
+        os.remove(tmp_file_path)
 elif input_url:
-    with st.spinner("Fetching and indexing URL…"):
+    with st.spinner("Indexing text from URL, please wait..."):
         loader = WebBaseLoader(input_url)
         docs_list = loader.load()
 
-if (uploaded_file or input_url) and (not docs_list or all(len((doc.page_content or "").strip()) == 0 for doc in docs_list)):
+if (uploaded_file or input_url) and (not docs_list or all(len(doc.page_content.strip()) == 0 for doc in docs_list)):
     st.error("No text found in the provided PDF or URL. Please try another.")
     st.stop()
 
-# ===============================
-# Build lightweight Chroma retriever (keep functionality; lower memory)
-# ===============================
 if docs_list:
-    with st.spinner("Splitting & building vector index…"):
-        splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-            chunk_size=CHUNK_SIZE,
-            chunk_overlap=CHUNK_OVERLAP,
-        )
-        doc_splits = splitter.split_documents(docs_list)
-        # Cap number of chunks to index to keep RAM usage in check
-        doc_splits = doc_splits[:MAX_INDEX_CHUNKS]
-
+    with st.spinner("Splitting and indexing document, please wait..."):
+        text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(chunk_size=500, chunk_overlap=50)
+        doc_splits = text_splitter.split_documents(docs_list)
+        
         db = Chroma.from_documents(doc_splits, embeddings, persist_directory=chroma_dir)
-        retriever = db.as_retriever(search_kwargs={"k": RETRIEVER_K})
-        st.sidebar.success("Document indexed. You can now ask questions.")
+        retriever = db.as_retriever()
+        
+        st.sidebar.success("You can now ask questions based on this document.")
 
-# ===============================
-# LLM (same as your original)
-# ===============================
-llm = ChatGroq(groq_api_key=GROQ_API_KEY, model_name="Gemma2-9b-It")
+# Setup LLM
+llm = ChatGroq(groq_api_key=groq_api_key, model_name="Gemma2-9b-It")
 
-# ===============================
-# External Agents (same as your original, wrapped for LangGraph)
-# ===============================
-wikipedia_tool = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper(top_k_results=1))
-arxiv_tool = ArxivQueryRun(api_wrapper=ArxivAPIWrapper(top_k_results=1))
-serp_wrapper = SerpAPIWrapper(serpapi_api_key=SERP_API_KEY) if SERP_API_KEY else None
+# Tool Wrappers
+arxiv = ArxivQueryRun(api_wrapper=ArxivAPIWrapper(top_k_results=1))
+serp = SerpAPIWrapper(serpapi_api_key=serp_api_key)
+wikipedia = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper(top_k_results=1))
 
+# State
 class GraphState(TypedDict):
     question: str
-    documents: List[Document]
+    documents: List[str]
 
+# Retrieval Functions
+def retrieve(state):
+    question = state["question"]
+    documents = retriever.invoke(question)
+    cleaned_docs = [Document(page_content=doc.page_content if isinstance(doc.page_content, str) else str(doc.page_content)) for doc in documents]
+    return {"documents": cleaned_docs, "question": question}
 
-def _wrap_text_to_doc(text: str) -> Document:
-    return Document(page_content=text if isinstance(text, str) else str(text))
+def wiki_search_fn(state):
+    docs = wikipedia.invoke({"query": state["question"]})
+    content = docs if isinstance(docs, str) else str(docs)
+    return {"documents": [Document(page_content=content)], "question": state["question"]}
 
-# ---- Retrieval node (uploaded doc retriever) ----
-def retrieve_node(state: GraphState) -> GraphState:
-    q = state["question"]
-    docs = retriever.invoke(q) if retriever is not None else []
-    # Ensure page_content is str
-    cleaned = [_wrap_text_to_doc(d.page_content) for d in docs]
-    return {"question": q, "documents": cleaned}
+def arxiv_search_fn(state):
+    docs = arxiv.invoke({"query": state["question"]})
+    content = docs if isinstance(docs, str) else str(docs)
+    return {"documents": [Document(page_content=content)], "question": state["question"]}
 
-# ---- Wikipedia node ----
-def wiki_node(state: GraphState) -> GraphState:
-    q = state["question"]
-    try:
-        res = wikipedia_tool.invoke({"query": q})
-        text = res if isinstance(res, str) else str(res)
-    except Exception as e:
-        text = f"[Wikipedia error] {e}"
-    return {"question": q, "documents": [_wrap_text_to_doc(text)]}
+def serp_search_fn(state):
+    docs = serp.run(state["question"])
+    content = docs if isinstance(docs, str) else str(docs)
+    return {"documents": [Document(page_content=content)], "question": state["question"]}
 
-# ---- Arxiv node ----
-def arxiv_node(state: GraphState) -> GraphState:
-    q = state["question"]
-    try:
-        res = arxiv_tool.invoke({"query": q})
-        text = res if isinstance(res, str) else str(res)
-    except Exception as e:
-        text = f"[Arxiv error] {e}"
-    return {"question": q, "documents": [_wrap_text_to_doc(text)]}
-
-# ---- Serp (Google) node ----
-def serp_node(state: GraphState) -> GraphState:
-    q = state["question"]
-    if not serp_wrapper:
-        return {"question": q, "documents": [_wrap_text_to_doc("[SerpAPI key missing] Skipping Google search.")]}
-    try:
-        res = serp_wrapper.run(q)
-        text = res if isinstance(res, str) else str(res)
-    except Exception as e:
-        text = f"[SerpAPI error] {e}"
-    return {"question": q, "documents": [_wrap_text_to_doc(text)]}
-
-# ---- Build graph (preserve original order & behavior) ----
+# Graph
 workflow = StateGraph(GraphState)
+workflow.add_node("retrieve", retrieve)
+workflow.add_node("wiki_search", wiki_search_fn)
+workflow.add_node("arxiv_search", arxiv_search_fn)
+workflow.add_node("serp_search", serp_search_fn)
 
-# Nodes
-if retriever is not None:
-    workflow.add_node("retrieve", retrieve_node)
-workflow.add_node("wiki_search", wiki_node)
-workflow.add_node("arxiv_search", arxiv_node)
-workflow.add_node("serp_search", serp_node)
-
-# Edges
-if retriever is not None:
-    workflow.add_edge("retrieve", "wiki_search")
-else:
-    # If no document, start directly from wiki
-    pass
+workflow.add_edge("retrieve", "wiki_search")
 workflow.add_edge("wiki_search", "arxiv_search")
 workflow.add_edge("arxiv_search", "serp_search")
 workflow.add_edge("serp_search", END)
-workflow.add_edge(START, "retrieve" if retriever is not None else "wiki_search")
+workflow.add_edge(START, "retrieve" if retriever else "wiki_search")
 
 app = workflow.compile()
 
-# ===============================
-# Ask/Answer loop
-# ===============================
+# Run on question directly
 if question:
-    st.markdown(f"### Your Question\n> {question}")
+    st.markdown(f"### Your Question: {question}")
+    inputs = {"question": question}
+    all_responses = []
 
-    contexts: List[str] = []
+    with st.spinner("Searching, please wait..."):
+        question_word_count = len(question.split())
+        is_specific_question = question_word_count > 5
+        use_document = retriever is not None and is_specific_question
 
-    # Strategy:
-    #   • If we have a doc retriever, use it and show top chunks
-    #   • Always run the graph stream; keep only PER_SOURCE_TAKE item per node
-    #   • Merge doc chunks + agent snippets; hard‑cap chars
+        if use_document:
+            st.info("🔎 Using uploaded document for answering...")
+            docs = retriever.invoke(question)
+            cleaned_docs = [doc.page_content for doc in docs]
+            combined_text = "\n\n".join([f"{content}" for content in cleaned_docs])
+        else:
+            st.info("🌐 Using multi-agent (Wiki, Arxiv, Google) sources...")
+            for output in app.stream(inputs):
+                for key, value in output.items():
+                    docs = value.get("documents", [])
+                    for doc in docs:
+                        all_responses.append((key, doc.page_content))
 
-    # 1) Document retrieval (if available)
-    if retriever is not None:
-        st.info("🔎 Using uploaded document for answering…")
-        doc_hits = retriever.invoke(question)
-        doc_hits = doc_hits[:RETRIEVER_K]
-        for i, d in enumerate(doc_hits, 1):
-            with st.expander(f"Document chunk {i}"):
-                st.write(d.page_content)
-            contexts.append(d.page_content)
-    else:
-        st.info("🌐 No document provided — using multi‑agent search…")
+            combined_text = "\n\n".join([f"Source: {key}\n{content}" for key, content in all_responses])
 
-    # 2) Multi‑agent stream (Wiki ➜ Arxiv ➜ Serp)
-    seen_per_key = {"wiki_search": 0, "arxiv_search": 0, "serp_search": 0}
-    for output in app.stream({"question": question, "documents": []}):
-        for key, value in output.items():
-            docs = value.get("documents", []) if isinstance(value, dict) else []
-            for doc in docs:
-                if key in seen_per_key and seen_per_key[key] >= PER_SOURCE_TAKE:
-                    continue
-                snippet = str(doc.page_content)[:1200]
-                with st.expander(f"{key} result #{seen_per_key.get(key, 0) + 1}"):
-                    st.write(snippet)
-                contexts.append(f"Source: {key}\n{snippet}")
-                if key in seen_per_key:
-                    seen_per_key[key] += 1
-
-    # 3) Build final context (cap aggressively)
-    merged = "\n\n".join(contexts)
-    if len(merged) > MAX_CTX_CHARS:
-        merged = merged[:MAX_CTX_CHARS] + "\n[...truncated...]"
+    # Truncate long content
+    max_chars = 7000
+    if len(combined_text) > max_chars:
+        combined_text = combined_text[:max_chars] + "\n[...truncated...]"
 
     final_prompt = f"""
-    You are a helpful assistant. Below are excerpts from relevant sources (document chunks and external agents).
+    You are a helpful assistant. Below are excerpts from relevant sources:
 
-    {merged}
+    {combined_text}
 
-    Based on this, provide the most accurate and relevant answer to: {question}
-    If sources disagree or are insufficient, say so briefly and suggest next steps.
+    Based on this, please provide the most accurate and relevant answer to: {question}
     """
 
     try:
-        with st.spinner("Synthesizing answer…"):
-            final_answer = llm.invoke(final_prompt)
+        final_answer = llm.invoke(final_prompt)
+    except Exception as e:
+        st.error("❌ LLM failed to generate a response. Try again or reduce input size.")
+        st.exception(e)
+        final_answer = None
+
+    with st.expander("See Agent Work"):
+        if use_document:
+            for i, doc in enumerate(cleaned_docs):
+                st.markdown(f"### Source: `retriever - chunk {i+1}`")
+                st.write(doc)
+        else:
+            for key, content in all_responses:
+                st.markdown(f"### Source: `{key}`")
+                st.write(content)
+
+    if final_answer:
         st.markdown("## Your Answer")
         st.write(final_answer.content)
-    except Exception as e:
-        st.error("❌ LLM failed to generate a response. Try a simpler question or smaller document.")
-        st.exception(e)
 
-    # Attempt to free memory proactively
-    del contexts
-    gc.collect()
+# Cleanup on close
+@st.cache_resource
+def cleanup():
+    shutil.rmtree(chroma_dir)
+
+cleanup()
